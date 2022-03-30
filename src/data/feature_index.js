@@ -12,14 +12,18 @@ import vt from '@mapbox/vector-tile';
 import Protobuf from 'pbf';
 import GeoJSONFeature from '../util/vectortile_to_geojson.js';
 import {arraysIntersect, mapObject, extend} from '../util/util.js';
-import {OverscaledTileID} from '../source/tile_id.js';
+import {CanonicalTileID, OverscaledTileID} from '../source/tile_id.js';
 import {register} from '../util/web_worker_transfer.js';
 import EvaluationParameters from '../style/evaluation_parameters.js';
 import SourceFeatureState from '../source/source_state.js';
-import {polygonIntersectsBox} from '../util/intersection_tests.js';
+import {polygonIntersectsBox, polygonIntersectsPolygon} from '../util/intersection_tests.js';
 import {PossiblyEvaluated} from '../style/properties.js';
 import {FeatureIndexArray} from './array_types.js';
 import {DEMSampler} from '../terrain/elevation.js';
+import {mat4} from 'gl-matrix';
+import {convexHull} from '../util/convex_hull.js';
+import assert from 'assert';
+import {projectClamped} from '../symbol/projection.js';
 
 import type StyleLayer from '../style/style_layer.js';
 import type {QueryFeature} from '../util/vectortile_to_geojson.js';
@@ -29,6 +33,7 @@ import type {FilterSpecification, PromoteIdSpecification} from '../style-spec/ty
 import type {TilespaceQueryGeometry} from '../style/query_geometry.js';
 import type {FeatureIndex as FeatureIndexStruct} from './array_types.js';
 import type {TileTransform} from '../geo/projection/tile_transform.js';
+import {globeTileBounds} from '../geo/projection/globe_util.js';
 
 type QueryParameters = {
     pixelPosMatrix: Float32Array,
@@ -124,11 +129,54 @@ class FeatureIndex {
         const tilespaceGeometry = args.tileResult;
         const transform = args.transform;
 
-        const bounds = tilespaceGeometry.bufferedTilespaceBounds;
-        const queryPredicate = (bx1, by1, bx2, by2) => {
-            return polygonIntersectsBox(tilespaceGeometry.bufferedTilespaceGeometry, bx1, by1, bx2, by2);
-        };
-        const matching = this.grid.query(bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y, queryPredicate);
+        let matching: Array<number> = [];
+
+        if (transform.projection.name === 'globe') {
+            assert(tilespaceGeometry.bufferedGeometrySpace === 'screen');
+            const bufferedGeometry = tilespaceGeometry.bufferedGeometry;
+
+            // Intersection tests are performed in pixel space by subdividing the feature index into
+            // a coarse 4x4 grid and projecting aabbs of these cells to screen space. The feature grid
+            // itself has 16x16 cells so coarse intersections are done in batches of 4x4 feature index cells
+            // at once. All cells belonging to a visible batch are automatically accepted and sent forward
+            // for more precise tests
+            const tileId = args.tileResult.tileID.canonical;
+            const matrix = mat4.multiply([], transform.pixelMatrix, transform.globeMatrix);
+
+            for (let y = 0; y < 4; y++) {
+                const yMin = y / 4 * EXTENT;
+                const yMax = (y + 1) / 4 * EXTENT;
+
+                for (let x = 0; x < 4; x++) {
+                    const subId = new CanonicalTileID(tileId.z + 2, tileId.x * 4 + x, tileId.y * 4 + y);
+                    const corners = globeTileBounds(subId).getCorners().map((c: any) => {
+                        const p = projectClamped(c, matrix);
+                        return new Point(p[0], p[1]);
+                    });
+
+                    const poly = convexHull(corners);
+
+                    if (!polygonIntersectsPolygon(poly, bufferedGeometry)) {
+                        continue;
+                    }
+
+                    const xMin = x / 4 * EXTENT;
+                    const xMax = (x + 1) / 4 * EXTENT;
+
+                    matching.push(...this.grid.query(xMin, yMin, xMax, yMax));
+                }
+            }
+        } else {
+            assert(tilespaceGeometry.bufferedGeometrySpace === 'tile');
+
+            const bounds = tilespaceGeometry.bufferedBounds;
+            const queryPredicate = (bx1, by1, bx2, by2) => {
+                return polygonIntersectsBox(tilespaceGeometry.bufferedGeometry, bx1, by1, bx2, by2);
+            };
+
+            matching = this.grid.query(bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y, queryPredicate);
+        }
+
         matching.sort(topDownFeatureComparator);
 
         let elevationHelper = null;
