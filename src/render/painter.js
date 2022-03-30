@@ -619,7 +619,9 @@ class Painter {
             }
         }
 
-        drawAtmosphere(this);
+        if (this.style.fog) {
+            drawAtmosphere(this, this.style.fog);
+        }
 
         // Translucent pass ===============================================
         // Draw all other layers bottom-to-top.
