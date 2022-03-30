@@ -424,7 +424,10 @@ class Tile {
                 }
 
                 geometryViz.addPoints(tileResult.tilespaceGeometry);
-                boundsViz.addPoints(tileResult.bufferedTilespaceGeometry);
+
+                if (tileResult.bufferedGeometrySpace === 'tile') {
+                    boundsViz.addPoints(tileResult.bufferedGeometry);
+                }
             }
         });
 

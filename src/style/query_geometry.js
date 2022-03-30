@@ -2,17 +2,20 @@
 
 import Point from '@mapbox/point-geometry';
 import {getBounds, clamp, polygonizeBounds, bufferConvexPolygon} from '../util/util.js';
-import {polygonIntersectsBox} from '../util/intersection_tests.js';
+import {polygonIntersectsBox, polygonIntersectsPolygon} from '../util/intersection_tests.js';
 import EXTENT from '../data/extent.js';
 import type {PointLike} from '@mapbox/point-geometry';
 import type Transform from '../geo/transform.js';
 import type Tile from '../source/tile.js';
 import pixelsToTileUnits from '../source/pixels_to_tile_units.js';
-import {vec3} from 'gl-matrix';
+import {vec3, mat4} from 'gl-matrix';
 import {Ray} from '../util/primitives.js';
 import MercatorCoordinate from '../geo/mercator_coordinate.js';
 import type {OverscaledTileID} from '../source/tile_id.js';
 import {getTilePoint, getTileVec3} from '../geo/projection/tile_transform.js';
+import {globeTileBounds} from '../geo/projection/globe_util.js';
+import {convexHull} from '../util/convex_hull.js';
+import {projectClamped} from '../symbol/projection.js';
 
 /**
  * A data-class that represents a screenspace query from `Map#queryRenderedFeatures`.
@@ -26,7 +29,6 @@ export class QueryGeometry {
     cameraPoint: Point;
     screenGeometry: Point[];
     screenGeometryMercator: MercatorCoordinate[];
-    cameraGeometry: Point[];
 
     _screenRaycastCache: { [_: number]: MercatorCoordinate[]};
     _cameraRaycastCache: { [_: number]: MercatorCoordinate[]};
@@ -42,7 +44,6 @@ export class QueryGeometry {
 
         this.screenGeometry = this.bufferedScreenGeometry(0);
         this.screenGeometryMercator = this.screenGeometry.map((p) => transform.pointCoordinate3D(p));
-        this.cameraGeometry = this.bufferedCameraGeometry(0);
     }
 
     /**
@@ -166,6 +167,52 @@ export class QueryGeometry {
         return bufferConvexPolygon(cameraPolygon, buffer);
     }
 
+    // Creates a convex polygon in screen coordinates that encompasses the query frustum and
+    // the camera location at globe's surface. Camera point can be at any side of the query polygon as
+    // opposed to `bufferedCameraGeometry` which restricts the location to underneath the polygon.
+    bufferedCameraGeometryGlobe(buffer: number): Point[] {
+        const min = this.screenBounds[0];
+        const max = this.screenBounds.length === 1 ? this.screenBounds[0].add(new Point(1, 1)) : this.screenBounds[1];
+
+        // Padding is added to the query polygon before inclusion of the camera location.
+        // Otherwise the buffered (narrow) polygon could penetrate the globe creating a lot of false positives
+        const cameraPolygon = polygonizeBounds(min, max, buffer, false);
+
+        const camPos = this.cameraPoint.clone();
+        const column = (camPos.x > min.x) + (camPos.x > max.x);
+        const row = (camPos.y > min.y) + (camPos.y > max.y);
+        const sector = row * 3 + column;
+
+        switch (sector) {
+        case 0:     // replace top-left point
+            cameraPolygon[0] = camPos;
+            break;
+        case 1:     // insert point in the middle of top-left and top-right
+            cameraPolygon.splice(1, 0, camPos);
+            break;
+        case 2:     // replace top-right point
+            cameraPolygon[1] = camPos;
+            break;
+        case 3:     // insert point in the middle of top-left and bottom-left
+            cameraPolygon.splice(4, 0, camPos);
+            break;
+        case 5:     // insert point in the middle of top-right and bottom-right
+            cameraPolygon.splice(2, 0, camPos);
+            break;
+        case 6:     // replace bottom-left point
+            cameraPolygon[3] = camPos;
+            break;
+        case 7:     // insert point in the middle of bottom-left and bottom-right
+            cameraPolygon.splice(3, 0, camPos);
+            break;
+        case 8:     // replace bottom-right point
+            cameraPolygon[2] = camPos;
+            break;
+        }
+
+        return cameraPolygon;
+    }
+
     /**
      * Checks if a tile is contained within this query geometry.
      *
@@ -182,9 +229,6 @@ export class QueryGeometry {
         const padding = tile.queryPadding + bias;
         const wrap = tile.tileID.wrap;
 
-        const geometryForTileCheck = use3D ?
-            this._bufferedCameraMercator(padding, transform).map((p) => getTilePoint(tile.tileTransform, p, wrap)) :
-            this._bufferedScreenMercator(padding, transform).map((p) => getTilePoint(tile.tileTransform, p, wrap));
         const tilespaceVec3s = this.screenGeometryMercator.map((p) => getTileVec3(tile.tileTransform, p, wrap));
         const tilespaceGeometry = tilespaceVec3s.map((v) => new Point(v[0], v[1]));
 
@@ -197,17 +241,53 @@ export class QueryGeometry {
         });
         const pixelToTileUnitsFactor = pixelsToTileUnits(tile, 1, transform.zoom);
 
-        if (polygonIntersectsBox(geometryForTileCheck, 0, 0, EXTENT, EXTENT)) {
-            return {
-                queryGeometry: this,
-                tilespaceGeometry,
-                tilespaceRays,
-                bufferedTilespaceGeometry: geometryForTileCheck,
-                bufferedTilespaceBounds: clampBoundsToTileExtents(getBounds(geometryForTileCheck)),
-                tile,
-                tileID: tile.tileID,
-                pixelToTileUnitsFactor
-            };
+        if (transform.projection.name === 'globe') {
+            // To determine whether a tile is contained within the query geometry we'll
+            // project corners of tile's aabb to screen space for intersection tests.
+            // This is far more easier task than trying to find mercator projection of
+            // the query geometry in globe view.
+            const bufferedGeometry = use3D ?
+                this.bufferedCameraGeometryGlobe(padding) :
+                this.bufferedScreenGeometry(padding);
+
+            const tileBounds = globeTileBounds(tile.tileID.canonical);
+            const matrix = mat4.multiply([], transform.pixelMatrix, transform.globeMatrix);
+            const polygon = convexHull(tileBounds.getCorners().map(c => {
+                const p = projectClamped((c: any), matrix);
+                return new Point(p[0], p[1]);
+            }));
+
+            if (polygonIntersectsPolygon(polygon, bufferedGeometry)) {
+                return {
+                    queryGeometry: this,
+                    tilespaceGeometry,
+                    tilespaceRays,
+                    bufferedGeometrySpace: "screen",
+                    bufferedGeometry,
+                    bufferedBounds: getBounds(bufferedGeometry),
+                    tile,
+                    tileID: tile.tileID,
+                    pixelToTileUnitsFactor
+                };
+            }
+        } else {
+            const geometryForTileCheck = use3D ?
+                this._bufferedCameraMercator(padding, transform).map((p) => getTilePoint(tile.tileTransform, p, wrap)) :
+                this._bufferedScreenMercator(padding, transform).map((p) => getTilePoint(tile.tileTransform, p, wrap));
+
+            if (polygonIntersectsBox(geometryForTileCheck, 0, 0, EXTENT, EXTENT)) {
+                return {
+                    queryGeometry: this,
+                    tilespaceGeometry,
+                    tilespaceRays,
+                    bufferedGeometrySpace: "tile",
+                    bufferedGeometry: geometryForTileCheck,
+                    bufferedBounds: clampBoundsToTileExtents(getBounds(geometryForTileCheck)),
+                    tile,
+                    tileID: tile.tileID,
+                    pixelToTileUnitsFactor
+                };
+            }
         }
     }
 
@@ -249,8 +329,9 @@ export type TilespaceQueryGeometry = {
     queryGeometry: QueryGeometry,
     tilespaceGeometry: Point[],
     tilespaceRays: Ray[],
-    bufferedTilespaceGeometry: Point[],
-    bufferedTilespaceBounds: { min: Point, max: Point},
+    bufferedGeometrySpace: "screen" | "tile",
+    bufferedGeometry: Point[],
+    bufferedBounds: { min: Point, max: Point},
     tile: Tile,
     tileID: OverscaledTileID,
     pixelToTileUnitsFactor: number
